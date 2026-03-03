@@ -373,6 +373,7 @@ class SimpleFusionModel(nn.Module):
         deformation_hidden_dim: int = 64,
         decoder_hidden_dim: int = 128,
         direct_position_scale: float = 0.05,
+        max_scale: float = 0.01,
         initial_period: float = 1.0,
     ) -> None:
         super().__init__()
@@ -401,6 +402,7 @@ class SimpleFusionModel(nn.Module):
 
         self.decoder_mode = decoder_mode
         self.embedding_dim = embedding_dim
+        self.max_scale = float(max_scale)
         self.canonical_xyz = nn.Parameter(canonical_xyz.float())
         self.canonical_latent = nn.Parameter(canonical_latent.float())
 
@@ -475,7 +477,7 @@ class SimpleFusionModel(nn.Module):
 
         return GaussianFrame(
             xyz=xyz,
-            scaling_logits=compact_params[:, :3],
+            scaling_logits=torch.clamp(compact_params[:, :3], max=math.log(self.max_scale)),
             rotations=compact_params[:, 3:7],
             density=compact_params[:, 7:8],
             latent=latent,

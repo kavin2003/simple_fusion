@@ -106,3 +106,21 @@ def psnr(
     """PSNR per image in a batch.  img1/img2: [B, C, H, W]"""
     mse_val = mse(img1, img2, mask)
     return 10 * torch.log10(pixel_max**2 / mse_val.float())
+
+
+def tv_3d_loss(volume: torch.Tensor) -> torch.Tensor:
+    """Total variation regularization on a 3D volume.
+
+    Accepts [D,H,W], [1,D,H,W], or [B,1,D,H,W].
+    """
+    if volume.ndim == 3:
+        volume = volume.unsqueeze(0).unsqueeze(0)
+    elif volume.ndim == 4:
+        volume = volume.unsqueeze(1)
+    elif volume.ndim != 5:
+        raise ValueError("volume must have shape [D,H,W], [1,D,H,W], or [B,1,D,H,W].")
+
+    tv_d = torch.abs(volume[:, :, 1:, :, :] - volume[:, :, :-1, :, :]).mean()
+    tv_h = torch.abs(volume[:, :, :, 1:, :] - volume[:, :, :, :-1, :]).mean()
+    tv_w = torch.abs(volume[:, :, :, :, 1:] - volume[:, :, :, :, :-1]).mean()
+    return (tv_d + tv_h + tv_w) / 3.0
