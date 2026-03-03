@@ -19,8 +19,27 @@ from simple_fusion.model import (
     initialize_canonical_latent_from_encoder,
 )
 from simple_fusion.rendering import render_projection
-from simple_fusion.loss_utils import l1_loss, ssim, tv_3d_loss
+from simple_fusion.loss_utils import l1_loss, ssim
 from xray_gaussian_rasterization_voxelization import GaussianVoxelizer, GaussianVoxelizationSettings
+
+
+def tv_3d_loss(volume: torch.Tensor) -> torch.Tensor:
+    """Total variation regularization on a 3D volume.
+
+    Kept local to avoid hard import dependency mismatches across environments.
+    Accepts [D,H,W], [1,D,H,W], or [B,1,D,H,W].
+    """
+    if volume.ndim == 3:
+        volume = volume.unsqueeze(0).unsqueeze(0)
+    elif volume.ndim == 4:
+        volume = volume.unsqueeze(1)
+    elif volume.ndim != 5:
+        raise ValueError("volume must have shape [D,H,W], [1,D,H,W], or [B,1,D,H,W].")
+
+    tv_d = torch.abs(volume[:, :, 1:, :, :] - volume[:, :, :-1, :, :]).mean()
+    tv_h = torch.abs(volume[:, :, :, 1:, :] - volume[:, :, :, :-1, :]).mean()
+    tv_w = torch.abs(volume[:, :, :, :, 1:] - volume[:, :, :, :, :-1]).mean()
+    return (tv_d + tv_h + tv_w) / 3.0
 
 
 def parse_args() -> argparse.Namespace:
