@@ -43,6 +43,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--grid-dim", type=int, default=12)
     p.add_argument("--video-frames", type=int, default=50)
     p.add_argument("--voxel-res", type=int, default=128, help="3D PSNR 体素分辨率")
+    p.add_argument("--max-scale", type=float, default=0.01, help="Gaussian 最大尺度约束")
     p.add_argument("--decoder-checkpoint", default="gs-embedding/checkpoints/checkpoint_sfvae_sh0_144.pth")
     p.add_argument("--seed", type=int, default=0)
     return p.parse_args()
@@ -119,11 +120,16 @@ def compute_3d_psnr(model: SimpleFusionModel, scene, res: int = 128):
         pred_volume = pred_volume.squeeze()
     pred_volume = pred_volume.float().to(device)
 
-    mse_3d = torch.mean((pred_volume - gt_volume_rescaled) ** 2).item()
+    p_min, p_max = pred_volume.min(), pred_volume.max()
+    g_min, g_max = gt_volume_rescaled.min(), gt_volume_rescaled.max()
+    pred_norm = (pred_volume - p_min) / (p_max - p_min + 1e-7)
+    gt_norm = (gt_volume_rescaled - g_min) / (g_max - g_min + 1e-7)
+
+    mse_3d = torch.mean((pred_norm - gt_norm) ** 2).item()
 
     # 打印一下范围，方便调试
-    print(f"[Debug] Pred range: {pred_volume.min():.4f}-{pred_volume.max():.4f}")
-    print(f"[Debug] GT range: {gt_volume_rescaled.min():.4f}-{gt_volume_rescaled.max():.4f}")
+    print(f"[Debug] Pred Original Range: {p_min:.4f}-{p_max:.4f}")
+    print(f"[Debug] GT Original Range: {g_min:.4f}-{g_max:.4f}")
 
     if mse_3d < 1e-10:
         return 100.0
@@ -235,6 +241,7 @@ def main():
         decoder_checkpoint=args.decoder_checkpoint,
         decoder_mode="direct",
         freeze_decoder=True,
+        max_scale=args.max_scale,
     ).to(device)
 
     print(f"加载 Checkpoint: {args.checkpoint}")

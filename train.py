@@ -6,6 +6,7 @@ from pathlib import Path
 import random
 
 import torch
+import numpy as np
 
 from simple_fusion.data import (
     load_init_point_cloud,
@@ -19,6 +20,26 @@ from simple_fusion.model import (
 )
 from simple_fusion.rendering import render_projection
 from simple_fusion.loss_utils import l1_loss, ssim
+from xray_gaussian_rasterization_voxelization import GaussianVoxelizer, GaussianVoxelizationSettings
+
+
+def tv_3d_loss(volume: torch.Tensor) -> torch.Tensor:
+    """Total variation regularization on a 3D volume.
+
+    Kept local to avoid hard import dependency mismatches across environments.
+    Accepts [D,H,W], [1,D,H,W], or [B,1,D,H,W].
+    """
+    if volume.ndim == 3:
+        volume = volume.unsqueeze(0).unsqueeze(0)
+    elif volume.ndim == 4:
+        volume = volume.unsqueeze(1)
+    elif volume.ndim != 5:
+        raise ValueError("volume must have shape [D,H,W], [1,D,H,W], or [B,1,D,H,W].")
+
+    tv_d = torch.abs(volume[:, :, 1:, :, :] - volume[:, :, :-1, :, :]).mean()
+    tv_h = torch.abs(volume[:, :, :, 1:, :] - volume[:, :, :, :-1, :]).mean()
+    tv_w = torch.abs(volume[:, :, :, :, 1:] - volume[:, :, :, :, :-1]).mean()
+    return (tv_d + tv_h + tv_w) / 3.0
 
 
 def parse_args() -> argparse.Namespace:
@@ -88,8 +109,16 @@ def parse_args() -> argparse.Namespace:
                         help="L2 penalty on per-frame latent offsets (limits deformation size).")
     parser.add_argument("--lambda-plane", type=float, default=1e-4)
     parser.add_argument("--lambda-period", type=float, default=1e-5)
+    parser.add_argument("--lambda-tv3d", type=float, default=1e-4,
+                        help="Weight for 3D TV loss on voxelized Gaussian volume.")
+    parser.add_argument("--tv3d-every", type=int, default=10,
+                        help="Apply 3D TV loss every N steps (0 to disable).")
+    parser.add_argument("--tv3d-res", type=int, default=64,
+                        help="Voxel resolution for 3D TV regularization.")
     parser.add_argument("--decoder-hidden-dim", type=int, default=128)
     parser.add_argument("--direct-position-scale", type=float, default=0.05)
+    parser.add_argument("--max-scale", type=float, default=0.01,
+                        help="Hard upper bound for Gaussian scale after decoding.")
     parser.add_argument("--freeze-decoder", action="store_true")
     parser.add_argument("--decode-chunk-size", type=int, default=1024)
     parser.add_argument("--seed", type=int, default=0)
@@ -129,6 +158,34 @@ def apply_preset(args: argparse.Namespace) -> None:
     args.split_scale_threshold = 0.01
     args.opacity_reset_every = 3000
     args.opacity_reset_value = 0.01
+    args.lambda_plane = max(args.lambda_plane, 1e-3)
+
+
+def voxelize_frame(frame, scanner_cfg: dict, res: int) -> torch.Tensor:
+    voxel_size = np.array(scanner_cfg["sVoxel"], dtype=np.float32)
+    voxel_center = np.array(scanner_cfg["offOrigin"], dtype=np.float32)
+    settings = GaussianVoxelizationSettings(
+        scale_modifier=1.0,
+        nVoxel_x=int(res),
+        nVoxel_y=int(res),
+        nVoxel_z=int(res),
+        sVoxel_x=float(voxel_size[0]),
+        sVoxel_y=float(voxel_size[1]),
+        sVoxel_z=float(voxel_size[2]),
+        center_x=float(voxel_center[0]),
+        center_y=float(voxel_center[1]),
+        center_z=float(voxel_center[2]),
+        prefiltered=False,
+        debug=False,
+    )
+    voxelizer = GaussianVoxelizer(voxel_settings=settings)
+    volume, _ = voxelizer(
+        means3D=frame.xyz.contiguous(),
+        opacities=frame.density.contiguous(),
+        scales=torch.exp(frame.scaling_logits).contiguous(),
+        rotations=frame.rotations.contiguous(),
+    )
+    return volume
 
 
 def set_seed(seed: int) -> None:
@@ -257,6 +314,7 @@ def main() -> None:
         decode_chunk_size=args.decode_chunk_size,
         decoder_hidden_dim=args.decoder_hidden_dim,
         direct_position_scale=args.direct_position_scale,
+        max_scale=args.max_scale,
     ).cuda()
 
     optimizer, scheduler = build_optimizer_scheduler(
@@ -305,6 +363,9 @@ def main() -> None:
             losses["plane"] = args.lambda_plane * model.deformation_regularization()
         if args.lambda_period > 0:
             losses["period"] = args.lambda_period * model.period_regularization()
+        if args.lambda_tv3d > 0 and args.tv3d_every > 0 and step % args.tv3d_every == 0:
+            vol_pred = voxelize_frame(frame, scene.scanner_cfg, res=args.tv3d_res)
+            losses["tv_3d"] = args.lambda_tv3d * tv_3d_loss(vol_pred)
 
         total_loss = sum(losses.values())
 
@@ -322,7 +383,7 @@ def main() -> None:
                     grad_accum[visible_idx] += grad_norm[visible_idx]
                     grad_count[visible_idx] += 1
 
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
         optimizer.step()
         scheduler.step()
 
