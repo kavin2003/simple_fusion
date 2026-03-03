@@ -25,6 +25,7 @@ from simple_fusion.model import (
     initialize_canonical_latent_from_encoder,
 )
 from simple_fusion.rendering import render_projection
+from simple_fusion.camera import Camera
 
 from xray_gaussian_rasterization_voxelization import GaussianVoxelizer, GaussianVoxelizationSettings
 
@@ -61,44 +62,32 @@ def compute_3d_psnr(model: SimpleFusionModel, scene, res: int = 128):
     device = model.canonical_xyz.device
     frame = model(0.0)
 
+    # 训练时坐标被缩放到 scanner_cfg，对齐体素时应优先使用同一 scanner 空间。
+    voxel_size = np.array(scene.scanner_cfg["sVoxel"], dtype=np.float32)
+    voxel_center = np.array(scene.scanner_cfg["offOrigin"], dtype=np.float32)
+    voxel_settings = GaussianVoxelizationSettings(
+        scale_modifier=1.0,
+        nVoxel_x=int(res),
+        nVoxel_y=int(res),
+        nVoxel_z=int(res),
+        sVoxel_x=float(voxel_size[0]),
+        sVoxel_y=float(voxel_size[1]),
+        sVoxel_z=float(voxel_size[2]),
+        center_x=float(voxel_center[0]),
+        center_y=float(voxel_center[1]),
+        center_z=float(voxel_center[2]),
+        prefiltered=False,
+        debug=False,
+    )
+
     try:
-        from xray_gaussian_rasterization_voxelization import _C
-
-        # --- 新增：自动计算包围盒 (Bounding Box) ---
-        # 找出当前时刻所有高斯球的中心点范围
-        mins = frame.xyz.min(dim=0)[0]
-        maxs = frame.xyz.max(dim=0)[0]
-        center = (mins + maxs) / 2.0
-        # 计算采样步长 (sVoxel)，让网格恰好包裹住所有高斯球
-        # 假设物体是均匀的，我们取三个轴向最大的跨度
-        span = (maxs - mins).max().item()
-        sVoxel = span / res
-
-        print(f"[Debug] Auto-BBox Center: {center.cpu().numpy()}")
-        print(f"[Debug] Auto-sVoxel: {sVoxel:.6f}")
-
-        viewmatrix = torch.eye(4, device=device)
-
-        # 调用底层算子，传入动态计算的中心和步长
-        _, pred_volume, _, _, _, _ = _C.voxelize_gaussians(
-            frame.xyz.contiguous(),
-            frame.density.contiguous(),
-            frame.scaling_logits.contiguous(),
-            frame.rotations.contiguous(),
-            1.0,
-            viewmatrix.contiguous(),
-            int(res), int(res), int(res),
-            1.0, 1.0,  # tan_fov
-            float(center[0]), float(center[1]), float(center[2]),  # 自动对齐中心
-            float(sVoxel),  # 自动对齐尺度
-            False,
-            False
+        voxelizer = GaussianVoxelizer(voxel_settings=voxel_settings)
+        pred_volume, _ = voxelizer(
+            means3D=frame.xyz.contiguous(),
+            opacities=frame.density.contiguous(),
+            scales=torch.exp(frame.scaling_logits).contiguous(),
+            rotations=frame.rotations.contiguous(),
         )
-
-        # 检查采样后的范围
-        if pred_volume.max() == 0:
-            print("[Warning] 采样结果依然全为0，请检查 xyz 坐标量级是否与 scene.volume 匹配")
-
     except Exception as e:
         print(f"[Error] 调用 Voxelizer 算子失败: {e}")
         return 0.0
@@ -126,9 +115,9 @@ def compute_3d_psnr(model: SimpleFusionModel, scene, res: int = 128):
     ).squeeze()  # 变回 [res, res, res]
 
     # 4. 计算 PSNR
-    # 确保 pred_volume 也是 [res, res, res]
     if pred_volume.ndim > 3:
         pred_volume = pred_volume.squeeze()
+    pred_volume = pred_volume.float().to(device)
 
     mse_3d = torch.mean((pred_volume - gt_volume_rescaled) ** 2).item()
 
@@ -151,9 +140,6 @@ def render_orbital_video(model, ref_cam, output_path, n_frames=50):
     print(f"渲染 4D 轨道视频: {output_path}")
     frames = []
 
-    # 备份原始矩阵
-    orig_R = np.copy(ref_cam.R)
-
     for i in tqdm(range(n_frames)):
         t = i / n_frames
         angle = (i / n_frames) * 2 * math.pi
@@ -166,20 +152,28 @@ def render_orbital_video(model, ref_cam, output_path, n_frames=50):
             [-sin_a, 0, cos_a]
         ])
 
-        # 【关键修复】：手动更新旋转并重置相机的所有派生矩阵
-        ref_cam.R = orig_R @ rot_y
-
-        # 如果你的相机类有 update 方法，必须调用
-        if hasattr(ref_cam, 'update'):
-            ref_cam.update()
-            # 如果是 SimpleGS 框架，可能需要手动更新这个：
-        if hasattr(ref_cam, 'world_view_transform'):
-            from simple_fusion.rendering import get_view_matrix  # 假设有这个函数
-            # 此处逻辑取决于你的相机类实现，通常修改 R 后需要重新生成 transform
+        orbit_cam = Camera(
+            colmap_id=ref_cam.colmap_id,
+            scanner_cfg=ref_cam.scanner_cfg,
+            R=ref_cam.R @ rot_y,
+            T=ref_cam.T,
+            angle=ref_cam.angle,
+            mode=ref_cam.mode,
+            FoVx=ref_cam.FoVx,
+            FoVy=ref_cam.FoVy,
+            image=ref_cam.original_image.detach().cpu(),
+            image_name=ref_cam.image_name,
+            uid=ref_cam.uid,
+            time=ref_cam.time,
+            phase=ref_cam.phase,
+            trans=ref_cam.trans,
+            scale=ref_cam.scale,
+            data_device=str(ref_cam.data_device),
+        )
 
         frame_data = model(t)
         render_pkg = render_projection(
-            ref_cam,
+            orbit_cam,
             xyz=frame_data.xyz,
             scaling_logits=frame_data.scaling_logits,
             rotations=frame_data.rotations,
@@ -191,15 +185,15 @@ def render_orbital_video(model, ref_cam, output_path, n_frames=50):
         frames.append(img)
 
     imageio.mimsave(output_path, frames, fps=20)
-    ref_cam.R = orig_R
-
-
 # ---------------------------------------------------------------------------
 # Main 流程
 # ---------------------------------------------------------------------------
 
 def main():
     args = parse_args()
+    if not torch.cuda.is_available():
+        raise RuntimeError("evaluate.py 依赖 CUDA 光栅化/体素化算子，请在 GPU 环境运行。")
+
     device = torch.device("cuda")
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -212,18 +206,36 @@ def main():
         args.source_path, None, max_gaussians=args.max_gaussians, seed=args.seed
     )
 
-    # 初始化模型，确保结构与训练时完全一致
+    canonical_xyz = torch.from_numpy(xyz_np).to(device)
+    canonical_density = torch.from_numpy(density_np).to(device)
+    canonical_scaling_logits, canonical_rotations, canonical_density_logits = (
+        initialize_canonical_gaussian_params(
+            xyz=canonical_xyz,
+            density=canonical_density,
+        )
+    )
+    canonical_latent = initialize_canonical_latent_from_encoder(
+        xyz=canonical_xyz,
+        density=canonical_density,
+        checkpoint_path=args.decoder_checkpoint,
+        embedding_dim=args.embedding_dim,
+        grid_dim=args.grid_dim,
+        device=device,
+    )
+
+    # 初始化模型，保持与 train.py 一致
     model = SimpleFusionModel(
-        canonical_xyz=torch.from_numpy(xyz_np).cuda(),
-        canonical_scaling_logits=torch.zeros((len(xyz_np), 3)).cuda(),
-        canonical_rotations=torch.zeros((len(xyz_np), 4)).cuda(),
-        canonical_density_logits=torch.from_numpy(density_np).cuda(),
-        canonical_latent=torch.randn((len(xyz_np), args.embedding_dim)).cuda(),
+        canonical_xyz=canonical_xyz,
+        canonical_scaling_logits=canonical_scaling_logits,
+        canonical_rotations=canonical_rotations,
+        canonical_density_logits=canonical_density_logits,
+        canonical_latent=canonical_latent,
         embedding_dim=args.embedding_dim,
         grid_dim=args.grid_dim,
         decoder_checkpoint=args.decoder_checkpoint,
-        freeze_decoder=True
-    ).cuda()
+        decoder_mode="direct",
+        freeze_decoder=True,
+    ).to(device)
 
     print(f"加载 Checkpoint: {args.checkpoint}")
     ckpt = torch.load(args.checkpoint, map_location="cuda")

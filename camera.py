@@ -124,6 +124,7 @@ class Camera(nn.Module):
         super().__init__()
         self.uid = uid
         self.colmap_id = colmap_id
+        self.scanner_cfg = scanner_cfg
         self.R = R
         self.T = T
         self.angle = angle
