@@ -91,6 +91,18 @@ def parse_args() -> argparse.Namespace:
                         help="Evaluate on test cameras every N steps (0 = never).")
     parser.add_argument("--log-every", type=int, default=20,
                         help="Print per-component losses every N steps.")
+    parser.add_argument("--densify-every", type=int, default=100,
+                        help="Run 3DGS-style densify/prune every N steps (0 to disable).")
+    parser.add_argument("--densify-from", type=int, default=200,
+                        help="Start densification from this step.")
+    parser.add_argument("--densify-until", type=int, default=4000,
+                        help="Stop densification after this step.")
+    parser.add_argument("--densify-grad-thresh", type=float, default=2e-4,
+                        help="Gradient threshold used to clone/split Gaussians.")
+    parser.add_argument("--prune-min-opacity", type=float, default=0.01,
+                        help="Prune Gaussians whose opacity falls below this value.")
+    parser.add_argument("--split-scale-threshold", type=float, default=0.02,
+                        help="Split (instead of clone) when mean Gaussian scale is above this threshold.")
     return parser.parse_args()
 
 
@@ -118,6 +130,25 @@ def save_checkpoint(model: SimpleFusionModel, optimizer: torch.optim.Optimizer, 
         },
         checkpoint_path,
     )
+
+
+def build_optimizer_scheduler(
+    model: SimpleFusionModel,
+    *,
+    lr: float,
+    lr_final: float,
+    total_steps: int,
+) -> tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.CosineAnnealingLR]:
+    optimizer = torch.optim.Adam(
+        [parameter for parameter in model.parameters() if parameter.requires_grad],
+        lr=lr,
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=max(1, total_steps),
+        eta_min=lr_final,
+    )
+    return optimizer, scheduler
 
 
 @torch.no_grad()
@@ -202,13 +233,11 @@ def main() -> None:
         direct_position_scale=args.direct_position_scale,
     ).cuda()
 
-    optimizer = torch.optim.Adam(
-        [parameter for parameter in model.parameters() if parameter.requires_grad],
+    optimizer, scheduler = build_optimizer_scheduler(
+        model,
         lr=args.lr,
-    )
-    # Cosine annealing from lr to lr_final over all iterations.
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=args.iterations, eta_min=args.lr_final
+        lr_final=args.lr_final,
+        total_steps=args.iterations,
     )
 
     output_dir = Path(args.output_dir)
@@ -219,6 +248,9 @@ def main() -> None:
         f"latent_init={args.latent_init}, "
         f"decoder_mode={args.decoder_mode}."
     )
+
+    grad_accum = torch.zeros(model.canonical_xyz.shape[0], device=model.canonical_xyz.device)
+    grad_count = torch.zeros_like(grad_accum)
 
     for step in range(1, args.iterations + 1):
         camera = random.choice(scene.train_cameras)
@@ -251,14 +283,59 @@ def main() -> None:
 
         optimizer.zero_grad(set_to_none=True)
         total_loss.backward()
+
+        with torch.no_grad():
+            viewspace_points = render_pkg["viewspace_points"]
+            viewspace_grads = viewspace_points.grad
+            visibility = render_pkg["visibility_filter"]
+            if viewspace_grads is not None and visibility.numel() == grad_accum.numel():
+                grad_norm = viewspace_grads.norm(dim=-1)
+                visible_idx = torch.where(visibility)[0]
+                if visible_idx.numel() > 0:
+                    grad_accum[visible_idx] += grad_norm[visible_idx]
+                    grad_count[visible_idx] += 1
+
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         scheduler.step()
+
+        should_densify = (
+            args.decoder_mode == "direct"
+            and args.densify_every > 0
+            and args.densify_from <= step <= args.densify_until
+            and step % args.densify_every == 0
+        )
+        if should_densify:
+            densify_stats = model.densify_and_prune(
+                grad_accum=grad_accum,
+                grad_count=grad_count,
+                min_opacity=args.prune_min_opacity,
+                grad_threshold=args.densify_grad_thresh,
+                max_gaussians=args.max_gaussians,
+                split_scale_threshold=args.split_scale_threshold,
+            )
+            if densify_stats["added"] > 0 or densify_stats["pruned"] > 0:
+                current_lr = optimizer.param_groups[0]["lr"]
+                remaining_steps = max(1, args.iterations - step)
+                optimizer, scheduler = build_optimizer_scheduler(
+                    model,
+                    lr=current_lr,
+                    lr_final=args.lr_final,
+                    total_steps=remaining_steps,
+                )
+                print(
+                    f"  [densify] step={step:06d} added={densify_stats['added']} "
+                    f"pruned={densify_stats['pruned']} total={densify_stats['final']}"
+                )
+
+            grad_accum = torch.zeros(model.canonical_xyz.shape[0], device=model.canonical_xyz.device)
+            grad_count = torch.zeros_like(grad_accum)
 
         if step == 1 or step % args.log_every == 0:
             parts = [f"step={step:06d}", f"loss={total_loss.item():.6f}"]
             parts += [f"{k}={v.item():.2e}" for k, v in losses.items()]
             parts.append(f"period={model.time_encoder.period.item():.4f}")
+            parts.append(f"n_gauss={model.canonical_xyz.shape[0]}")
             print("  ".join(parts))
 
         if args.eval_every > 0 and (step % args.eval_every == 0 or step == args.iterations):
