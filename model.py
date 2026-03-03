@@ -498,6 +498,13 @@ class SimpleFusionModel(nn.Module):
         return self.time_encoder.regularization(target_period=target_period)
 
     @torch.no_grad()
+    def reset_opacity(self, opacity_value: float = 0.01) -> None:
+        if self.decoder_mode != "direct":
+            return
+        target = torch.full_like(self.canonical_density_logits, float(opacity_value))
+        self.canonical_density_logits.copy_(inverse_sigmoid(target))
+
+    @torch.no_grad()
     def densify_and_prune(
         self,
         *,

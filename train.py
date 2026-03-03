@@ -23,6 +23,13 @@ from simple_fusion.loss_utils import l1_loss, ssim
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Simple SF-VAE + X2-Gaussian fusion trainer")
+    parser.add_argument(
+        "--preset",
+        type=str,
+        default="default",
+        choices=["default", "paper2503"],
+        help="Parameter preset. 'paper2503' applies common 3DGS-style schedule used in arXiv:2503.21779.",
+    )
     parser.add_argument("--source-path", type=str, required=True, help="Path to the NAF .pickle dataset.")
     parser.add_argument(
         "--decoder-checkpoint",
@@ -103,7 +110,25 @@ def parse_args() -> argparse.Namespace:
                         help="Prune Gaussians whose opacity falls below this value.")
     parser.add_argument("--split-scale-threshold", type=float, default=0.02,
                         help="Split (instead of clone) when mean Gaussian scale is above this threshold.")
+    parser.add_argument("--opacity-reset-every", type=int, default=0,
+                        help="Reset Gaussian opacity every N steps (0 to disable).")
+    parser.add_argument("--opacity-reset-value", type=float, default=0.01,
+                        help="Target opacity used by periodic opacity reset.")
     return parser.parse_args()
+
+
+def apply_preset(args: argparse.Namespace) -> None:
+    if args.preset != "paper2503":
+        return
+
+    args.densify_every = 100
+    args.densify_from = 500
+    args.densify_until = min(args.iterations, 15000)
+    args.densify_grad_thresh = 2e-4
+    args.prune_min_opacity = 0.005
+    args.split_scale_threshold = 0.01
+    args.opacity_reset_every = 3000
+    args.opacity_reset_value = 0.01
 
 
 def set_seed(seed: int) -> None:
@@ -173,6 +198,7 @@ def evaluate(model: SimpleFusionModel, test_cameras: list) -> dict[str, float]:
 
 def main() -> None:
     args = parse_args()
+    apply_preset(args)
     if not torch.cuda.is_available():
         raise RuntimeError("This simple trainer requires CUDA because the X-ray rasterizer is CUDA-only.")
 
@@ -246,7 +272,8 @@ def main() -> None:
         f"{len(scene.test_cameras)} test views, "
         f"{model.canonical_xyz.shape[0]} canonical Gaussians, "
         f"latent_init={args.latent_init}, "
-        f"decoder_mode={args.decoder_mode}."
+        f"decoder_mode={args.decoder_mode}, "
+        f"preset={args.preset}."
     )
 
     grad_accum = torch.zeros(model.canonical_xyz.shape[0], device=model.canonical_xyz.device)
@@ -330,6 +357,15 @@ def main() -> None:
 
             grad_accum = torch.zeros(model.canonical_xyz.shape[0], device=model.canonical_xyz.device)
             grad_count = torch.zeros_like(grad_accum)
+
+        should_reset_opacity = (
+            args.decoder_mode == "direct"
+            and args.opacity_reset_every > 0
+            and step % args.opacity_reset_every == 0
+        )
+        if should_reset_opacity:
+            model.reset_opacity(opacity_value=args.opacity_reset_value)
+            print(f"  [opacity_reset] step={step:06d} value={args.opacity_reset_value:.4f}")
 
         if step == 1 or step % args.log_every == 0:
             parts = [f"step={step:06d}", f"loss={total_loss.item():.6f}"]
