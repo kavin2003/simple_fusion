@@ -496,3 +496,115 @@ class SimpleFusionModel(nn.Module):
 
     def period_regularization(self, target_period: float = 1.0) -> torch.Tensor:
         return self.time_encoder.regularization(target_period=target_period)
+
+    @torch.no_grad()
+    def reset_opacity(self, opacity_value: float = 0.01) -> None:
+        if self.decoder_mode != "direct":
+            return
+        target = torch.full_like(self.canonical_density_logits, float(opacity_value))
+        self.canonical_density_logits.copy_(inverse_sigmoid(target))
+
+    @torch.no_grad()
+    def densify_and_prune(
+        self,
+        *,
+        grad_accum: torch.Tensor,
+        grad_count: torch.Tensor,
+        min_opacity: float,
+        grad_threshold: float,
+        max_gaussians: int,
+        split_scale_threshold: float = 0.02,
+    ) -> dict[str, int]:
+        if self.decoder_mode != "direct":
+            return {"added": 0, "pruned": 0, "final": int(self.canonical_xyz.shape[0])}
+
+        device = self.canonical_xyz.device
+        n = self.canonical_xyz.shape[0]
+        if n == 0:
+            return {"added": 0, "pruned": 0, "final": 0}
+
+        grad_mean = grad_accum / grad_count.clamp_min(1.0)
+        opacity = torch.sigmoid(self.canonical_density_logits).squeeze(-1)
+        scale_world = torch.exp(self.canonical_scaling_logits).mean(dim=-1)
+
+        grad_trigger = grad_mean >= grad_threshold
+        split_mask = grad_trigger & (scale_world >= split_scale_threshold)
+        clone_mask = grad_trigger & (~split_mask)
+
+        # Keep growth bounded by max_gaussians.
+        free_slots = max(0, int(max_gaussians) - int(n))
+        split_idx = torch.where(split_mask)[0]
+        clone_idx = torch.where(clone_mask)[0]
+
+        # A split creates one extra Gaussian when parent is replaced by two children.
+        num_split = min(int(split_idx.numel()), free_slots)
+        free_slots -= num_split
+        num_clone = min(int(clone_idx.numel()), free_slots)
+        split_idx = split_idx[:num_split]
+        clone_idx = clone_idx[:num_clone]
+
+        new_xyz = []
+        new_scaling = []
+        new_rotation = []
+        new_density = []
+        new_latent = []
+
+        if num_split > 0:
+            base_xyz = self.canonical_xyz[split_idx]
+            base_scale = torch.exp(self.canonical_scaling_logits[split_idx])
+            jitter = torch.randn_like(base_xyz) * (0.5 * base_scale)
+
+            child_xyz_1 = base_xyz + jitter
+            child_xyz_2 = base_xyz - jitter
+            child_scale = (base_scale / 1.6).clamp_min(1e-4)
+            child_scaling_logits = torch.log(child_scale)
+            child_rotation = self.canonical_rotations[split_idx]
+            child_density = self.canonical_density_logits[split_idx] - 0.15
+            child_latent = self.canonical_latent[split_idx]
+
+            new_xyz += [child_xyz_1, child_xyz_2]
+            new_scaling += [child_scaling_logits, child_scaling_logits]
+            new_rotation += [child_rotation, child_rotation]
+            new_density += [child_density, child_density]
+            new_latent += [child_latent, child_latent]
+
+        if num_clone > 0:
+            clone_xyz = self.canonical_xyz[clone_idx]
+            clone_scaling = self.canonical_scaling_logits[clone_idx]
+            clone_rotation = self.canonical_rotations[clone_idx]
+            clone_density = self.canonical_density_logits[clone_idx] - 0.05
+            clone_latent = self.canonical_latent[clone_idx]
+
+            new_xyz.append(clone_xyz)
+            new_scaling.append(clone_scaling)
+            new_rotation.append(clone_rotation)
+            new_density.append(clone_density)
+            new_latent.append(clone_latent)
+
+        keep_mask = opacity >= float(min_opacity)
+        if num_split > 0:
+            keep_mask[split_idx] = False
+
+        xyz = self.canonical_xyz[keep_mask]
+        scaling_logits = self.canonical_scaling_logits[keep_mask]
+        rotations = self.canonical_rotations[keep_mask]
+        density_logits = self.canonical_density_logits[keep_mask]
+        latent = self.canonical_latent[keep_mask]
+
+        if new_xyz:
+            xyz = torch.cat([xyz] + new_xyz, dim=0)
+            scaling_logits = torch.cat([scaling_logits] + new_scaling, dim=0)
+            rotations = torch.cat([rotations] + new_rotation, dim=0)
+            density_logits = torch.cat([density_logits] + new_density, dim=0)
+            latent = torch.cat([latent] + new_latent, dim=0)
+
+        self.canonical_xyz = nn.Parameter(xyz.to(device))
+        self.canonical_scaling_logits = nn.Parameter(scaling_logits.to(device))
+        self.canonical_rotations = nn.Parameter(rotations.to(device))
+        self.canonical_density_logits = nn.Parameter(density_logits.to(device))
+        self.canonical_latent = nn.Parameter(latent.to(device))
+
+        final_n = int(self.canonical_xyz.shape[0])
+        added = int(final_n - keep_mask.sum().item())
+        pruned = int((~keep_mask).sum().item())
+        return {"added": added, "pruned": pruned, "final": final_n}
